@@ -1,4 +1,3 @@
-
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 import math
