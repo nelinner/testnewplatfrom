@@ -21,10 +21,18 @@ import pytesseract
 from PIL import Image
 import io
 
+# Попытка импорта генератора карточки профиля
+try:
+    from faceit_card_pillow import generate_profile_card
+except ImportError:
+    logging.warning("faceit_card_pillow.py не найден. Профиль будет текстовым.")
+    generate_profile_card = None
+
 # ==================== Конфигурация ====================
 TOKEN = "8873833506:AAG78i4w3wuFdrk18aKAYyXQXuXwoJVY1Kk"
 CHANNEL_USERNAME = "@hp404faceit"
 CREATOR_USERNAME = "@nelinner"
+IMAGE_URL = "https://i.postimg.cc/vBPMQmWy/Bez-nazvania150-20260905144110.jpg"
 
 LOBBY_CHAT_IDS = {
     ("default", "5x5"): 5,
@@ -302,10 +310,6 @@ async def draw_match(context: ContextTypes.DEFAULT_TYPE, lobby_id: int):
     host_id = random.choice(players_ids)
     ct_players = players_ids[::2]
     t_players = players_ids[1::2]
-    def format_player(uid):
-        user = get_user(uid)
-        return f"[👤] {user['nickname']} | {user['standoff_id']}" if user else ""
-    # Поскольку get_user асинхронный, нужно собрать данные асинхронно
     ct_list = []
     for uid in ct_players:
         user = await get_user(uid)
@@ -353,9 +357,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
         return
-    await update.message.reply_text(
-        "Добро пожаловать! Пройдите регистрацию.\n\n"
-        "1. [📃] Напишите ваш nickname которое используется в игре Standoff 2"
+    # Отправляем фото с инструкцией
+    await update.message.reply_photo(
+        photo=IMAGE_URL,
+        caption=(
+            "Добро пожаловать! Пройдите регистрацию.\n\n"
+            "1. [📃] Напишите ваш nickname которое используется в игре Standoff 2"
+        )
     )
     context.user_data["registration_step"] = "nickname"
 
@@ -458,6 +466,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "ticket_message":
             await handle_ticket_message(update, context, int(parts[1]))
             return
+        elif action == "settings":
+            await handle_settings_action(update, context, parts)
+            return
+        elif action == "admin":
+            await handle_admin_action(update, context, parts)
+            return
+        elif action == "find":
+            await handle_find_lobby(update, context)
+            return
+        elif action == "match_select":
+            await handle_match_select(update, context)
+            return
+        elif action == "ticket_type":
+            await handle_ticket_type(update, context)
+            return
         else:
             await handle_menu_callback(update, context)
             return
@@ -494,7 +517,40 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user(user_id)
     if not user:
         return
+
     kd = user["kills"] / user["deaths"] if user["deaths"] > 0 else 0.0
+
+    if generate_profile_card:
+        # Генерация карточки
+        card_data = {
+            "nickname": user["nickname"],
+            "standoff_id": user["standoff_id"],
+            "kills": user["kills"],
+            "deaths": user["deaths"],
+            "kd": kd,
+            "elo": user["elo"],
+            "level": user["level"],
+            "pro_league": user["pro_league"] == 1,
+            "avatar_file_id": user["avatar_file_id"]
+        }
+        try:
+            image_bytes = generate_profile_card(card_data)
+            keyboard = [[InlineKeyboardButton("⬅️ Главное меню", callback_data=f"menu:main:{user_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_photo(
+                photo=image_bytes,
+                caption="Профиль игрока",
+                reply_markup=reply_markup
+            )
+            # Удаляем исходное сообщение с меню, если это необходимо
+            # await query.message.delete()
+            return
+        except Exception as e:
+            logging.error(f"Ошибка генерации карточки: {e}")
+            # Падаем на текстовый профиль
+            pass
+
+    # Текстовый профиль
     text = (
         f"🪪 Профиль игрока • 404hp faceit\n"
         f"━━━━━━━━━━━\n"
@@ -523,6 +579,34 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text("⚙️ Настройки:", reply_markup=reply_markup)
+
+async def handle_settings_action(update: Update, context: ContextTypes.DEFAULT_TYPE, parts):
+    query = update.callback_query
+    action = parts[1]
+    user_id = int(parts[2])
+    if query.from_user.id != user_id:
+        await query.answer("Это не ваше меню!", show_alert=True)
+        return
+    if action == "reset":
+        await update_user(user_id, kills=0, deaths=0, elo=1000, level=1)
+        await query.answer("Статистика сброшена.", show_alert=True)
+        await show_profile(update, context)
+    elif action == "upload_avatar":
+        await query.message.reply_text("Отправьте фото для аватарки.")
+        context.user_data["awaiting_avatar"] = True
+    elif action == "delete_avatar":
+        await update_user(user_id, avatar_file_id=None)
+        await query.answer("Аватарка удалена.", show_alert=True)
+
+async def handle_avatar_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_avatar"):
+        return
+    user_id = update.effective_user.id
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    await update_user(user_id, avatar_file_id=file_id)
+    context.user_data.pop("awaiting_avatar", None)
+    await update.message.reply_text("Аватарка сохранена!")
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1011,6 +1095,239 @@ async def get_creator_id() -> int:
     # В реальном коде нужно получить ID через API, здесь заглушка
     return 123456789  # замените на актуальный ID пользователя @nelinner
 
+async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, parts):
+    query = update.callback_query
+    action = parts[1]
+    admin_id = query.from_user.id
+    user_id = int(parts[2])
+    if query.from_user.id != user_id or not await is_admin(admin_id):
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    if action == "list_players":
+        await admin_list_players(update, context)
+    elif action == "manage_maps":
+        await admin_manage_maps(update, context)
+    elif action == "manage_lobby":
+        await admin_manage_lobby(update, context)
+    elif action == "ban":
+        await admin_ban_start(update, context)
+    elif action == "unban":
+        await admin_unban_start(update, context)
+    elif action == "grant_admin":
+        if admin_id != await get_creator_id():
+            await query.answer("Только создатель может выдавать админку.", show_alert=True)
+            return
+        await admin_grant_start(update, context)
+    elif action == "revoke_admin":
+        if admin_id != await get_creator_id():
+            await query.answer("Только создатель может забирать админку.", show_alert=True)
+            return
+        await admin_revoke_start(update, context)
+    elif action == "reset_lobby":
+        await admin_reset_lobby(update, context, parts)
+        return
+    elif action == "add_map":
+        await admin_add_map_start(update, context)
+    elif action == "delete_map":
+        await admin_delete_map_start(update, context)
+
+async def admin_list_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT user_id, nickname, elo, level, pro_league FROM users WHERE registered = 1")
+        players = await cursor.fetchall()
+    if not players:
+        await query.edit_message_text("Нет зарегистрированных игроков.")
+        return
+    text = "Список игроков:\n\n"
+    for p in players:
+        pro = "👑" if p["pro_league"] else ""
+        text += f"{pro} {p['nickname']} | ELO: {p['elo']} | Уровень: {p['level']} | ID: {p['user_id']}\n"
+    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"menu:admin:{query.from_user.id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+async def admin_manage_maps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    global MAPS
+    text = "Текущие карты:\n" + "\n".join(MAPS)
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить карту", callback_data=f"admin:add_map:{query.from_user.id}")],
+        [InlineKeyboardButton("➖ Удалить карту", callback_data=f"admin:delete_map:{query.from_user.id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"menu:admin:{query.from_user.id}")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+async def admin_add_map_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите название карты для добавления:")
+    context.user_data["awaiting_map_add"] = True
+
+async def admin_add_map_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_map_add"):
+        return
+    map_name = update.message.text.strip()
+    if map_name in MAPS:
+        await update.message.reply_text("Такая карта уже есть.")
+    else:
+        MAPS.append(map_name)
+        await update.message.reply_text(f"Карта {map_name} добавлена.")
+    context.user_data.pop("awaiting_map_add", None)
+
+async def admin_delete_map_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите название карты для удаления:")
+    context.user_data["awaiting_map_delete"] = True
+
+async def admin_delete_map_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_map_delete"):
+        return
+    map_name = update.message.text.strip()
+    if map_name in MAPS:
+        MAPS.remove(map_name)
+        await update.message.reply_text(f"Карта {map_name} удалена.")
+    else:
+        await update.message.reply_text("Карта не найдена.")
+    context.user_data.pop("awaiting_map_delete", None)
+
+async def admin_manage_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lobbies = []
+    for league, mode in LOBBY_CHAT_IDS.keys():
+        lobby = await get_lobby(league, mode)
+        if lobby:
+            lobbies.append((league, mode, lobby))
+    if not lobbies:
+        await query.edit_message_text("Нет активных лобби.")
+        return
+    keyboard = []
+    for league, mode, lobby in lobbies:
+        keyboard.append([
+            InlineKeyboardButton(f"Сбросить {mode} {league}", callback_data=f"admin:reset_lobby:{league}:{mode}:{query.from_user.id}")
+        ])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"menu:admin:{query.from_user.id}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Управление лобби:", reply_markup=reply_markup)
+
+async def admin_reset_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, parts):
+    league = parts[2]
+    mode = parts[3]
+    await reset_lobby(context, league, mode)
+    await update.callback_query.answer("Лобби сброшено.", show_alert=True)
+
+async def admin_ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите ID пользователя или его ник для бана:")
+    context.user_data["awaiting_ban_target"] = True
+
+async def admin_unban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите ID пользователя или его ник для разбана:")
+    context.user_data["awaiting_unban_target"] = True
+
+async def admin_ban_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_ban_target"):
+        return
+    target = update.message.text.strip()
+    user = await find_user_by_nick_or_id(target)
+    if not user:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    if user["user_id"] == await get_creator_id():
+        await update.message.reply_text("Нельзя забанить создателя.")
+        return
+    context.user_data["ban_target_id"] = user["user_id"]
+    context.user_data.pop("awaiting_ban_target", None)
+    await update.message.reply_text("Введите причину бана (или отправьте '-' для перманентного бана):")
+    context.user_data["awaiting_ban_reason"] = True
+
+async def admin_unban_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_unban_target"):
+        return
+    target = update.message.text.strip()
+    user = await find_user_by_nick_or_id(target)
+    if not user:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM bans WHERE user_id = ?", (user["user_id"],))
+        await db.commit()
+    await update.message.reply_text("Пользователь разбанен.")
+    context.user_data.pop("awaiting_unban_target", None)
+
+async def admin_ban_reason_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_ban_reason"):
+        return
+    reason = update.message.text.strip()
+    target_id = context.user_data.get("ban_target_id")
+    if reason == "-":
+        banned_until = None  # перманентный бан
+    else:
+        banned_until = None  # для простоты, можно добавить срок
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO bans (user_id, reason, banned_until)
+            VALUES (?, ?, ?)
+        """, (target_id, reason, banned_until))
+        await db.commit()
+    await update.message.reply_text("Пользователь забанен.")
+    context.user_data.pop("awaiting_ban_reason", None)
+    context.user_data.pop("ban_target_id", None)
+
+async def find_user_by_nick_or_id(identifier: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if identifier.isdigit():
+            cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (int(identifier),))
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+        cursor = await db.execute("SELECT * FROM users WHERE nickname = ?", (identifier,))
+        row = await cursor.fetchone()
+        if row:
+            return dict(row)
+    return None
+
+async def admin_grant_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите ID пользователя или ник для выдачи админки:")
+    context.user_data["awaiting_grant_target"] = True
+
+async def admin_revoke_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.message.reply_text("Введите ID пользователя или ник для снятия админки:")
+    context.user_data["awaiting_revoke_target"] = True
+
+async def admin_grant_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_grant_target"):
+        return
+    target = update.message.text.strip()
+    user = await find_user_by_nick_or_id(target)
+    if not user:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    await update_user(user["user_id"], is_admin=1)
+    await update.message.reply_text("Админка выдана.")
+    context.user_data.pop("awaiting_grant_target", None)
+
+async def admin_revoke_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_revoke_target"):
+        return
+    target = update.message.text.strip()
+    user = await find_user_by_nick_or_id(target)
+    if not user:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+    if user["user_id"] == await get_creator_id():
+        await update.message.reply_text("Нельзя снять админку с создателя.")
+        return
+    await update_user(user["user_id"], is_admin=0)
+    await update.message.reply_text("Админка снята.")
+    context.user_data.pop("awaiting_revoke_target", None)
+
 # ==================== Основная функция ====================
 async def main():
     await init_db()
@@ -1019,10 +1336,10 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Добавляем обработчики сообщений для регистрации и других шагов
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_registration))
-    # Отдельные обработчики для шагов, зависящих от состояния
-    # (В реальном коде лучше использовать ConversationHandler, но для простоты оставим как есть)
+    # Обработчик текстовых сообщений (для всех состояний)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+    # Обработчик фото (для загрузки аватарки и скриншотов)
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_messages))
 
     # Планируем автосброс лобби при старте
     for league_type in ["default", "pro"]:
@@ -1034,6 +1351,42 @@ async def main():
             )
 
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверяем состояние и вызываем соответствующую функцию
+    if context.user_data.get("registration_step"):
+        await handle_registration(update, context)
+    elif context.user_data.get("awaiting_cancel_reason"):
+        await handle_cancel_reason(update, context)
+    elif context.user_data.get("awaiting_score"):
+        await handle_score_input(update, context)
+    elif context.user_data.get("awaiting_ticket_target") or context.user_data.get("awaiting_ticket_text"):
+        await handle_ticket_input(update, context)
+    elif context.user_data.get("awaiting_ticket_message"):
+        await handle_ticket_message_input(update, context)
+    elif context.user_data.get("awaiting_map_add"):
+        await admin_add_map_input(update, context)
+    elif context.user_data.get("awaiting_map_delete"):
+        await admin_delete_map_input(update, context)
+    elif context.user_data.get("awaiting_ban_target"):
+        await admin_ban_input(update, context)
+    elif context.user_data.get("awaiting_unban_target"):
+        await admin_unban_input(update, context)
+    elif context.user_data.get("awaiting_ban_reason"):
+        await admin_ban_reason_input(update, context)
+    elif context.user_data.get("awaiting_grant_target"):
+        await admin_grant_input(update, context)
+    elif context.user_data.get("awaiting_revoke_target"):
+        await admin_revoke_input(update, context)
+    else:
+        # Игнорируем или отправляем подсказку
+        pass
+
+async def handle_photo_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_avatar"):
+        await handle_avatar_upload(update, context)
+    elif context.user_data.get("awaiting_screenshot"):
+        await handle_screenshot(update, context)
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
